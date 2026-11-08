@@ -1,0 +1,21 @@
+# данные соревнования
+data/
+
+# файлы сабмитов и прочие выгрузки
+*.csv
+submissions/
+
+# обученные модели
+models/
+*.txt.model
+*.pkl
+
+# секреты
+.env
+
+# служебное
+.DS_Store
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
