@@ -1,12 +1,20 @@
+from pathlib import Path
+
 import polars as pl
 
-from src.data import load, flatten, time_split
+from src.data import load, flatten, time_split, click_examples
 from src.features import popularity, build_features, add_target
 from src.model import NOT_FEATURES, to_X, fit_ranker, top1, accuracy
 
-from pathlib import Path
-
 ROOT = Path(__file__).resolve().parent
+ALIVE = (
+    pl.col("views_3d") > 0
+)  # кандидаты — только продукты, которые показывали последние 3 дня
+
+
+def make_candidates(events, labels, products, pop):
+    """Кандидаты + признаки + ответ, только живые продукты."""
+    return add_target(build_features(events, products, pop), labels).filter(ALIVE)
 
 
 def main():
@@ -14,43 +22,72 @@ def main():
     train, test, ed = load()
     ftr, fte = flatten(train, ed), flatten(test, ed)
     products = sorted(train["target_product"].unique().to_list())
-
-    # 2. признаки
     pop = popularity([ftr, fte], products)
-    cand = add_target(build_features(ftr, products, pop), train)
-    cand = cand.filter(
-        pl.col("views_3d") > 0
-    )  # кандидаты — только продукты, которые показывали последние 3 дня
+
+    # 2. кандидаты для настоящих примеров train
+    cand = make_candidates(ftr, train, products, pop)
     features = [c for c in cand.columns if c not in NOT_FEATURES]
 
-    # 3. сплит по времени: val = последняя неделя train
+    # 3. новые примеры из кликов внутри историй (train — по 1 на клиента, test — все)
+    ev_tr, lab_tr = click_examples(ftr, products, per_example=1)
+    ev_te, lab_te = click_examples(fte, products)
+    extra = pl.concat(
+        [
+            make_candidates(ev_tr, lab_tr, products, pop),
+            make_candidates(ev_te, lab_te, products, pop),
+        ]
+    )
+    extra_labels = pl.concat([lab_tr, lab_te])
+
+    # 4. сплит по времени: val = последняя неделя train
+    #    новые примеры в обучение — только с кликом ДО cut, иначе подсмотрим будущее
     tr_ex, val_ex, cut = time_split(train, ftr)
     tr = cand.filter(pl.col("end") < cut)
     val = cand.filter(pl.col("end") >= cut)
+    extra_tr = extra.join(
+        extra_labels.filter(pl.col("click_ts") < cut).select("example_id"),
+        on="example_id",
+        how="semi",
+    )
 
-    # 4. test-подобная валидация: только ответы-продукты, которые показывают в апреле
+    # 5. две валидации
+    #    testlike — val без ответов-продуктов, которых нет в апреле
+    #    april — новые примеры из кликов в test-историях после конца train
     train_end = ftr["timestamp"].max()
-    april = fte.filter(
+    april_products = fte.filter(
         (pl.col("encoded_event") == 13) & (pl.col("timestamp") > train_end)
     )["encoded_product"].unique()
     val_labels = val_ex.select("example_id", "target_product")
-    val_testlike = val_labels.filter(pl.col("target_product").is_in(april.implode()))
+    val_testlike = val_labels.filter(
+        pl.col("target_product").is_in(april_products.implode())
+    )
+    april_labels = lab_te.filter(pl.col("click_ts") > train_end).select(
+        "example_id", "target_product"
+    )
+    april = extra.join(april_labels.select("example_id"), on="example_id", how="semi")
 
-    # 5. модель и сравнение с правилом view
-    model = fit_ranker(tr, features, products)
-    pred = top1(val, model.predict(to_X(val, features, products)))
-    view = top1(val, -val["rk_13"].fill_null(999).to_numpy())
-
-    print(len(features), "признаков")
-    for name, p in [("view", view), ("ranker", pred)]:
+    # 6. модель и сравнение с правилом view
+    model = fit_ranker(pl.concat([tr, extra_tr]), features, products)
+    print(
+        len(features),
+        "признаков,",
+        extra_tr["example_id"].n_unique(),
+        "доп. примеров,",
+        april_labels.height,
+        "апрельских",
+    )
+    for name, score in [
+        ("view", lambda d: -d["rk_13"].fill_null(999).to_numpy()),
+        ("ranker", lambda d: model.predict(to_X(d, features, products))),
+    ]:
+        p_val, p_apr = top1(val, score(val)), top1(april, score(april))
         print(
-            f"{name:7s} val {accuracy(p, val_labels):.4f}  testlike {accuracy(p, val_testlike):.4f}"
+            f"{name:7s} val {accuracy(p_val, val_labels):.4f}  "
+            f"testlike {accuracy(p_val, val_testlike):.4f}  april {accuracy(p_apr, april_labels):.4f}"
         )
 
-    # 6. финальная модель: обучаем на всем train (tr + val) и сохраняем
-    # это лучше, тк последняя неделя трейна у нас самая показательная для обучения
-    # она наиболее приближена к реальным данным с теста
-    final = fit_ranker(cand, features, products)
+    # 7. финальная модель: всё, что есть (train + все новые примеры), и сохраняем
+    final = fit_ranker(pl.concat([cand, extra]), features, products)
     (ROOT / "models").mkdir(exist_ok=True)
     final.booster_.save_model(str(ROOT / "models" / "ranker.txt"))
     print("модель сохранена в models/ranker.txt")
