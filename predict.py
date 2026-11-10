@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import lightgbm as lgb
+import polars as pl
 
 from src.data import load, flatten
 from src.features import popularity, build_features
@@ -17,6 +18,7 @@ def main():
     # признаки для test — та же функция, та же популярность
     pop = popularity([ftr, fte], products)
     cand = build_features(fte, products, pop)
+    cand = cand.filter(pl.col("views_3d") > 0)
 
     # загружаем модель и берём ровно те признаки, на которых она училась
     model = lgb.Booster(model_file=str(ROOT / "models" / "ranker.txt"))

@@ -18,6 +18,9 @@ def main():
     # 2. признаки
     pop = popularity([ftr, fte], products)
     cand = add_target(build_features(ftr, products, pop), train)
+    cand = cand.filter(
+        pl.col("views_3d") > 0
+    )  # кандидаты — только продукты, которые показывали последние 3 дня
     features = [c for c in cand.columns if c not in NOT_FEATURES]
 
     # 3. сплит по времени: val = последняя неделя train

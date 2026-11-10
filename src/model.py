@@ -25,6 +25,12 @@ def to_X(df, features, products):
 
 def fit_ranker(df, features, products):
     """Обучить ранкер: внутри каждого клиента поднять наверх продукт с y = 1."""
+    # выкидываем клиентов, у которых правильного продукта нет среди кандидатов
+    # (после фильтра мёртвых продуктов, например 55 в феврале, когда его не показывали)
+    has_target = (
+        df.group_by("example_id").agg(pl.col("y").max()).filter(pl.col("y") == 1)
+    )
+    df = df.join(has_target.select("example_id"), on="example_id", how="semi")
     df = df.sort("example_id")  # строки одного клиента должны идти подряд
     # для lgbm ranker нужен group — сколько строк подряд относятся к одному клиенту: [32, 32, 32, ...]
     groups = df.group_by("example_id", maintain_order=True).len()["len"].to_numpy()
