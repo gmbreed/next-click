@@ -4,6 +4,10 @@ from src.data import load, flatten, time_split
 from src.features import popularity, build_features, add_target
 from src.model import NOT_FEATURES, to_X, fit_ranker, top1, accuracy
 
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
 
 def main():
     # 1. данные
@@ -39,6 +43,14 @@ def main():
         print(
             f"{name:7s} val {accuracy(p, val_labels):.4f}  testlike {accuracy(p, val_testlike):.4f}"
         )
+
+    # 6. финальная модель: обучаем на всем train (tr + val) и сохраняем
+    # это лучше, тк последняя неделя трейна у нас самая показательная для обучения
+    # она наиболее приближена к реальным данным с теста
+    final = fit_ranker(cand, features, products)
+    (ROOT / "models").mkdir(exist_ok=True)
+    final.booster_.save_model(str(ROOT / "models" / "ranker.txt"))
+    print("модель сохранена в models/ranker.txt")
 
 
 if __name__ == "__main__":
