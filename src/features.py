@@ -4,6 +4,7 @@ from src.data import DAY_MS
 EVENT_CODES = [13, 399, 542, 835, 469, 162, 271, 759]  # самые частые события с продуктом, были в EDA
 HOUR = 3600
 DAY = 24 * HOUR
+RANK_CODES = [399, 542, 835, 469]  # для них тоже «как давно» и ранг свежести
 
 def candidates(events, products):
     """строим базовую табличку с маркером для клика и продукта у пользователя
@@ -42,6 +43,7 @@ def history_features(events):
         ago.max().alias("since_first"),  # сколько секунд назад было первое событие с продуктом
         ago.filter(pl.col("encoded_event") == 13).min().alias("since_13"),  # сколько секунд назад был последний показ продукта
         ago.filter(pl.col("event_type") == "click").min().alias("since_click"),  # сколько секунд назад был последний клик по продукту
+        *[ago.filter(pl.col("encoded_event") == c).min().alias(f"since_{c}") for c in RANK_CODES],
     )
     # ранги свежести внутри клиента: 1 = самый свежий продукт (rk_13 == 1 — это правило view)
     # 2;3;4;... - чем больше ранг, тем более старое событие
@@ -49,9 +51,9 @@ def history_features(events):
     # а другой за то же время 10, это тоже надо учитывать, а не только время от конца
     return feats.with_columns(
         pl.col("since_13").rank("ordinal").over("example_id").alias("rk_13"), #попробуем добавить ранг только для самого частого действия в отдельности
-        # TODO: попробовать для других действий тоже добавить ранг
         pl.col("since_last").rank("ordinal").over("example_id").alias("rk_any"),
         pl.col("since_click").rank("ordinal").over("example_id").alias("rk_click"),
+        *[pl.col(f"since_{c}").rank("ordinal").over("example_id").alias(f"rk_{c}") for c in RANK_CODES],
     )
 
 def recent_features(events):

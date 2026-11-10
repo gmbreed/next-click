@@ -4,7 +4,10 @@ import polars as pl
 
 from src.data import load, flatten, time_split, click_examples
 from src.features import popularity, build_features, add_target
-from src.model import NOT_FEATURES, to_X, fit_ranker, top1, accuracy
+from src.model import NOT_FEATURES, fit_ranker, predict_proba, debias, top1, accuracy
+
+SEEDS = [0, 1, 2]  # несколько моделей с разным seed, усредняем
+BETAS = [0.0, 0.25, 0.4]  # сила поправки на предвзятость показов
 
 ROOT = Path(__file__).resolve().parent
 ALIVE = (
@@ -66,31 +69,25 @@ def main():
     )
     april = extra.join(april_labels.select("example_id"), on="example_id", how="semi")
 
-    # 6. модель и сравнение с правилом view
-    model = fit_ranker(pl.concat([tr, extra_tr]), features, products)
-    print(
-        len(features),
-        "признаков,",
-        extra_tr["example_id"].n_unique(),
-        "доп. примеров,",
-        april_labels.height,
-        "апрельских",
-    )
-    for name, score in [
-        ("view", lambda d: -d["rk_13"].fill_null(999).to_numpy()),
-        ("ranker", lambda d: model.predict(to_X(d, features, products))),
-    ]:
-        p_val, p_apr = top1(val, score(val)), top1(april, score(april))
-        print(
-            f"{name:7s} val {accuracy(p_val, val_labels):.4f}  "
-            f"testlike {accuracy(p_val, val_testlike):.4f}  april {accuracy(p_apr, april_labels):.4f}"
-        )
+    # 6. модели (по одной на seed) и сравнение с правилом view
+    models = [fit_ranker(pl.concat([tr, extra_tr]), features, products, seed=s) for s in SEEDS]
+    print(len(features), "признаков,", extra_tr["example_id"].n_unique(), "доп. примеров,", april_labels.height, "апрельских")
+    p_val = top1(val, -val["rk_13"].fill_null(999).to_numpy())
+    p_apr = top1(april, -april["rk_13"].fill_null(999).to_numpy())
+    print(f"view        testlike {accuracy(p_val, val_testlike):.4f}  april {accuracy(p_apr, april_labels):.4f}")
+    proba_val = predict_proba(models, val, features, products)
+    proba_apr = predict_proba(models, april, features, products)
+    for beta in BETAS:
+        p_val = top1(val, debias(val, proba_val, beta))
+        p_apr = top1(april, debias(april, proba_apr, beta))
+        print(f"beta={beta:<5} testlike {accuracy(p_val, val_testlike):.4f}  april {accuracy(p_apr, april_labels):.4f}")
 
-    # 7. финальная модель: всё, что есть (train + все новые примеры), и сохраняем
-    final = fit_ranker(pl.concat([cand, extra]), features, products)
+    # 7. финальные модели: всё, что есть (train + все новые примеры), по одной на seed
     (ROOT / "models").mkdir(exist_ok=True)
-    final.booster_.save_model(str(ROOT / "models" / "ranker.txt"))
-    print("модель сохранена в models/ranker.txt")
+    for s in SEEDS:
+        final = fit_ranker(pl.concat([cand, extra]), features, products, seed=s)
+        final.booster_.save_model(str(ROOT / "models" / f"ranker_{s}.txt"))
+    print("модели сохранены в models/ranker_*.txt")
 
 
 if __name__ == "__main__":

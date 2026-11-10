@@ -1,6 +1,7 @@
 import lightgbm as lgb
 import pandas as pd
 import polars as pl
+import numpy as np
 
 NOT_FEATURES = ["example_id", "end", "day", "target_product", "y"]
 PARAMS = dict(
@@ -23,7 +24,7 @@ def to_X(df, features, products):
     return X
 
 
-def fit_ranker(df, features, products):
+def fit_ranker(df, features, products, seed=0):
     """Обучить ранкер: внутри каждого клиента поднять наверх продукт с y = 1."""
     # выкидываем клиентов, у которых правильного продукта нет среди кандидатов
     # (после фильтра мёртвых продуктов, например 55 в феврале, когда его не показывали)
@@ -34,7 +35,7 @@ def fit_ranker(df, features, products):
     df = df.sort("example_id")  # строки одного клиента должны идти подряд
     # для lgbm ranker нужен group — сколько строк подряд относятся к одному клиенту: [32, 32, 32, ...]
     groups = df.group_by("example_id", maintain_order=True).len()["len"].to_numpy()
-    model = lgb.LGBMRanker(**PARAMS)
+    model = lgb.LGBMRanker(**{**PARAMS, "random_state": seed})
     model.fit(to_X(df, features, products), df["y"].to_numpy(), group=groups)
     return model
 
@@ -57,3 +58,28 @@ def accuracy(pred, labels):
         .select((pl.col("pred") == pl.col("target_product")).fill_null(False).mean())
         .item()
     )
+
+
+def proba_by_example(df, scores):
+    """Скоры модели -> вероятности внутри клиента (softmax: сумма по его продуктам = 1)."""
+    return (
+        df.select("example_id")
+        .with_columns(pl.Series("s", scores))
+        .with_columns(
+            (pl.col("s") - pl.col("s").max().over("example_id")).exp().alias("e")
+        )
+        .select(pl.col("e") / pl.col("e").sum().over("example_id"))
+        .to_series()
+        .to_numpy()
+    )
+
+
+def predict_proba(models, df, features, products):
+    """Усредняем вероятности нескольких моделей (разные seed)."""
+    X = to_X(df, features, products)
+    return sum(proba_by_example(df, m.predict(X)) for m in models) / len(models)
+
+
+def debias(df, proba, beta):
+    """Поправка на предвзятость показов банка: log p - beta * log(популярность продукта в показах)."""
+    return np.log(proba) - beta * np.log(df["pop_3d"].to_numpy() + 1e-4)
