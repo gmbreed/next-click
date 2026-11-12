@@ -3,7 +3,7 @@ from pathlib import Path
 import polars as pl
 
 from src.data import load, flatten, time_split, click_examples
-from src.features import popularity, build_features, add_target
+from src.features import popularity, fresh_popularity, build_features, add_target
 from src.model import NOT_FEATURES, fit_ranker, predict_proba, top1, accuracy
 
 SEEDS = [0, 1, 2]  # несколько моделей с разным seed, усредняем
@@ -14,9 +14,9 @@ ALIVE = (
 )  # кандидаты — только продукты, которые показывали последние 3 дня
 
 
-def make_candidates(events, labels, products, pop):
+def make_candidates(events, labels, products, pop, fresh):
     """Кандидаты + признаки + ответ, только живые продукты."""
-    return add_target(build_features(events, products, pop), labels).filter(ALIVE)
+    return add_target(build_features(events, products, pop, fresh), labels).filter(ALIVE)
 
 
 def main():
@@ -26,8 +26,10 @@ def main():
     products = sorted(train["target_product"].unique().to_list())
     pop = popularity([ftr, fte], products)
 
+    fresh = fresh_popularity([ftr, fte], products)
+
     # 2. кандидаты для настоящих примеров train
-    cand = make_candidates(ftr, train, products, pop)
+    cand = make_candidates(ftr, train, products, pop, fresh)
     features = [c for c in cand.columns if c not in NOT_FEATURES]
 
     # 3. новые примеры из кликов внутри историй (train — по 1 на клиента, test — все)
@@ -35,8 +37,8 @@ def main():
     ev_te, lab_te = click_examples(fte, products)
     extra = pl.concat(
         [
-            make_candidates(ev_tr, lab_tr, products, pop),
-            make_candidates(ev_te, lab_te, products, pop),
+            make_candidates(ev_tr, lab_tr, products, pop, fresh),
+            make_candidates(ev_te, lab_te, products, pop, fresh),
         ]
     )
     extra_labels = pl.concat([lab_tr, lab_te])

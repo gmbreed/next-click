@@ -5,6 +5,7 @@ EVENT_CODES = [13, 399, 542, 835, 469, 162, 271, 759]  # самые частые
 HOUR = 3600
 DAY = 24 * HOUR
 RANK_CODES = [399, 542, 835, 469]  # для них тоже «как давно» и ранг свежести
+HOUR_MS = 60 * 60 * 1000
 
 def candidates(events, products):
     """строим базовую табличку с маркером для клика и продукта у пользователя
@@ -49,7 +50,7 @@ def history_features(events):
     # 2;3;4;... - чем больше ранг, тем более старое событие
     # ранги нужны для уравновешивания клиентов: один клиент может сделать 1 действие с продуктом за час,
     # а другой за то же время 10, это тоже надо учитывать, а не только время от конца
-    
+
     # сортировка обязательна: rank("ordinal") при равных значениях смотрит на порядок строк,
     # а порядок после group_by от запуска к запуску разный -> без неё сабмит не воспроизводится
     return feats.sort("example_id", "encoded_product").with_columns(
@@ -116,7 +117,38 @@ def popularity(events_list, products, windows=(3, 7, 28)):
     ).select("day", "encoded_product", "views_3d", "pop_3d", "pop_7d", "pop_28d", "pop_trend")
 
 
-def build_features(events, products, pop):
+def fresh_popularity(events_list, products, code=13, hours=24):
+    """Доля продукта среди показов банка за 24 часа ДО и 24 часа ПОСЛЕ — на каждый час.
+    pop_3d считается по календарным дням и после смены режима (07.04) ещё три дня смотрит в старый режим;
+    окно «после» видит новый режим сразу (истории всех клиентов test нам выданы целиком)."""
+    views = pl.concat([
+        e.filter(pl.col("encoded_event") == code).select("timestamp", "encoded_product")
+        for e in events_list
+    ]).with_columns((pl.col("timestamp") // HOUR_MS).alias("hour"))
+    hourly = views.group_by("hour", "encoded_product").len()
+    hrs = pl.DataFrame({"hour": pl.int_range(hourly["hour"].min(), hourly["hour"].max() + 1, eager=True)})
+    prods = pl.DataFrame({"encoded_product": products}).cast(pl.Int32)
+    grid = (
+        hrs.join(prods, how="cross")
+        .join(hourly, on=["hour", "encoded_product"], how="left")
+        .with_columns(pl.col("len").fill_null(0))
+        .sort("hour")
+    )
+    grid = grid.with_columns(
+        # показы за часы h-24 .. h-1
+        pl.col("len").rolling_sum(hours, min_samples=1).shift(1).fill_null(0).over("encoded_product").alias("views_b24"),
+        # показы за часы h .. h+23 (в конце данных окно короче — берём сколько есть)
+        pl.col("len").reverse().rolling_sum(hours, min_samples=1).reverse().over("encoded_product").alias("views_f24"),
+    )
+    return grid.with_columns(
+        (pl.col("views_b24") / pl.col("views_b24").sum().over("hour").clip(1)).alias("pop_b24"),
+        (pl.col("views_f24") / pl.col("views_f24").sum().over("hour").clip(1)).alias("pop_f24"),
+    ).with_columns(
+        (pl.col("pop_f24") / (pl.col("pop_b24") + 1e-4)).alias("pop_fb")  # >1 — продукт стали показывать чаще
+    ).select("hour", "encoded_product", "pop_b24", "pop_f24", "pop_fb")
+
+
+def build_features(events, products, pop, fresh):
     """Кандидаты + все группы признаков."""
     #pop - таблица из popularity, считается один раз по train и test вместе
     keys = ["example_id", "encoded_product"]
@@ -128,6 +160,11 @@ def build_features(events, products, pop):
         .with_columns(pl.col("^n_.*$").fill_null(0))
         .with_columns((pl.col("end") // DAY_MS).alias("day"))
         .join(pop, on=["day", "encoded_product"], how="left")
+    )
+    cand = (
+        cand.with_columns((pl.col("end") // HOUR_MS).alias("hour"))
+        .join(fresh, on=["hour", "encoded_product"], how="left")
+        .drop("hour")
     )
     return cand.with_columns(
         (pl.col("n_13") / pl.col("ex_n_13")).alias("share_13") # какая доля показов этого клиента пришлась на продукт

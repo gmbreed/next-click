@@ -4,7 +4,7 @@ import lightgbm as lgb
 import polars as pl
 
 from src.data import load, flatten
-from src.features import popularity, build_features
+from src.features import popularity, fresh_popularity, build_features
 from src.model import predict_proba, top1
 
 ROOT = Path(__file__).resolve().parent
@@ -17,7 +17,8 @@ def main():
 
     # 2. признаки для test — та же функция, та же популярность, тот же фильтр живых
     pop = popularity([ftr, fte], products)
-    cand = build_features(fte, products, pop).filter(pl.col("views_3d") > 0)
+    fresh = fresh_popularity([ftr, fte], products)
+    cand = build_features(fte, products, pop, fresh).filter(pl.col("views_3d") > 0)
 
     # 3. все сохранённые модели (по одной на seed), усредняем их вероятности
     models = [
