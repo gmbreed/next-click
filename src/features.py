@@ -49,7 +49,10 @@ def history_features(events):
     # 2;3;4;... - чем больше ранг, тем более старое событие
     # ранги нужны для уравновешивания клиентов: один клиент может сделать 1 действие с продуктом за час,
     # а другой за то же время 10, это тоже надо учитывать, а не только время от конца
-    return feats.with_columns(
+    
+    # сортировка обязательна: rank("ordinal") при равных значениях смотрит на порядок строк,
+    # а порядок после group_by от запуска к запуску разный -> без неё сабмит не воспроизводится
+    return feats.sort("example_id", "encoded_product").with_columns(
         pl.col("since_13").rank("ordinal").over("example_id").alias("rk_13"), #попробуем добавить ранг только для самого частого действия в отдельности
         pl.col("since_last").rank("ordinal").over("example_id").alias("rk_any"),
         pl.col("since_click").rank("ordinal").over("example_id").alias("rk_click"),

@@ -4,10 +4,9 @@ import polars as pl
 
 from src.data import load, flatten, time_split, click_examples
 from src.features import popularity, build_features, add_target
-from src.model import NOT_FEATURES, fit_ranker, predict_proba, debias, top1, accuracy
+from src.model import NOT_FEATURES, fit_ranker, predict_proba, top1, accuracy
 
 SEEDS = [0, 1, 2]  # несколько моделей с разным seed, усредняем
-BETAS = [0.0, 0.25, 0.4]  # сила поправки на предвзятость показов
 
 ROOT = Path(__file__).resolve().parent
 ALIVE = (
@@ -75,12 +74,9 @@ def main():
     p_val = top1(val, -val["rk_13"].fill_null(999).to_numpy())
     p_apr = top1(april, -april["rk_13"].fill_null(999).to_numpy())
     print(f"view        testlike {accuracy(p_val, val_testlike):.4f}  april {accuracy(p_apr, april_labels):.4f}")
-    proba_val = predict_proba(models, val, features, products)
-    proba_apr = predict_proba(models, april, features, products)
-    for beta in BETAS:
-        p_val = top1(val, debias(val, proba_val, beta))
-        p_apr = top1(april, debias(april, proba_apr, beta))
-        print(f"beta={beta:<5} testlike {accuracy(p_val, val_testlike):.4f}  april {accuracy(p_apr, april_labels):.4f}")
+    p_val = top1(val, predict_proba(models, val, features, products))
+    p_apr = top1(april, predict_proba(models, april, features, products))
+    print(f"ranker      testlike {accuracy(p_val, val_testlike):.4f}  april {accuracy(p_apr, april_labels):.4f}")
 
     # 7. финальные модели: всё, что есть (train + все новые примеры), по одной на seed
     (ROOT / "models").mkdir(exist_ok=True)

@@ -1,7 +1,6 @@
 import lightgbm as lgb
 import pandas as pd
 import polars as pl
-import numpy as np
 
 NOT_FEATURES = ["example_id", "end", "day", "target_product", "y"]
 PARAMS = dict(
@@ -32,7 +31,7 @@ def fit_ranker(df, features, products, seed=0):
         df.group_by("example_id").agg(pl.col("y").max()).filter(pl.col("y") == 1)
     )
     df = df.join(has_target.select("example_id"), on="example_id", how="semi")
-    df = df.sort("example_id")  # строки одного клиента должны идти подряд
+    df = df.sort("example_id", "encoded_product")
     # для lgbm ranker нужен group — сколько строк подряд относятся к одному клиенту: [32, 32, 32, ...]
     groups = df.group_by("example_id", maintain_order=True).len()["len"].to_numpy()
     model = lgb.LGBMRanker(**{**PARAMS, "random_state": seed})
@@ -44,7 +43,7 @@ def top1(df, scores):
     """Для каждого клиента — продукт с максимальным скором."""
     return (
         df.with_columns(pl.Series("score", scores))
-        .sort("score", descending=True)
+        .sort("score", "encoded_product", descending=[True, False])
         .group_by("example_id")
         .first()
         .select("example_id", pl.col("encoded_product").alias("pred"))
@@ -78,8 +77,3 @@ def predict_proba(models, df, features, products):
     """Усредняем вероятности нескольких моделей (разные seed)."""
     X = to_X(df, features, products)
     return sum(proba_by_example(df, m.predict(X)) for m in models) / len(models)
-
-
-def debias(df, proba, beta):
-    """Поправка на предвзятость показов банка: log p - beta * log(популярность продукта в показах)."""
-    return np.log(proba) - beta * np.log(df["pop_3d"].to_numpy() + 1e-4)
