@@ -1,8 +1,9 @@
 import lightgbm as lgb
 import pandas as pd
 import polars as pl
+import numpy as np
 
-NOT_FEATURES = ["example_id", "end", "day", "target_product", "y"]
+NOT_FEATURES = ["example_id", "end", "day", "target_product", "y", "w"]
 PARAMS = dict(
     n_estimators=300,
     learning_rate=0.05,
@@ -31,11 +32,12 @@ def fit_ranker(df, features, products, seed=0):
         df.group_by("example_id").agg(pl.col("y").max()).filter(pl.col("y") == 1)
     )
     df = df.join(has_target.select("example_id"), on="example_id", how="semi")
-    df = df.sort("example_id", "encoded_product")
+    df = df.sort("example_id", "encoded_product")  # строки одного клиента должны идти подряд
     # для lgbm ranker нужен group — сколько строк подряд относятся к одному клиенту: [32, 32, 32, ...]
     groups = df.group_by("example_id", maintain_order=True).len()["len"].to_numpy()
     model = lgb.LGBMRanker(**{**PARAMS, "random_state": seed})
-    model.fit(to_X(df, features, products), df["y"].to_numpy(), group=groups)
+    weight = df["w"].to_numpy() if "w" in df.columns else None  # вес примера (апрельские важнее)
+    model.fit(to_X(df, features, products), df["y"].to_numpy(), group=groups, sample_weight=weight)
     return model
 
 

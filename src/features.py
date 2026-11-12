@@ -5,7 +5,6 @@ EVENT_CODES = [13, 399, 542, 835, 469, 162, 271, 759]  # самые частые
 HOUR = 3600
 DAY = 24 * HOUR
 RANK_CODES = [399, 542, 835, 469]  # для них тоже «как давно» и ранг свежести
-HOUR_MS = 60 * 60 * 1000
 
 def candidates(events, products):
     """строим базовую табличку с маркером для клика и продукта у пользователя
@@ -50,7 +49,6 @@ def history_features(events):
     # 2;3;4;... - чем больше ранг, тем более старое событие
     # ранги нужны для уравновешивания клиентов: один клиент может сделать 1 действие с продуктом за час,
     # а другой за то же время 10, это тоже надо учитывать, а не только время от конца
-
     # сортировка обязательна: rank("ordinal") при равных значениях смотрит на порядок строк,
     # а порядок после group_by от запуска к запуску разный -> без неё сабмит не воспроизводится
     return feats.sort("example_id", "encoded_product").with_columns(
@@ -117,6 +115,9 @@ def popularity(events_list, products, windows=(3, 7, 28)):
     ).select("day", "encoded_product", "views_3d", "pop_3d", "pop_7d", "pop_28d", "pop_trend")
 
 
+HOUR_MS = 60 * 60 * 1000
+
+
 def fresh_popularity(events_list, products, code=13, hours=24):
     """Доля продукта среди показов банка за 24 часа ДО и 24 часа ПОСЛЕ — на каждый час.
     pop_3d считается по календарным дням и после смены режима (07.04) ещё три дня смотрит в старый режим;
@@ -148,7 +149,104 @@ def fresh_popularity(events_list, products, code=13, hours=24):
     ).select("hour", "encoded_product", "pop_b24", "pop_f24", "pop_fb")
 
 
-def build_features(events, products, pop, fresh):
+def add_since_click(cand, events):
+    """Показы карусели ПОСЛЕ последнего клика клиента — что банк показывает ему «сейчас».
+    n13_sc — показы продукта, ex_n13_sc — все показы, share_sc — доля, ex_since_clk — секунд с последнего клика."""
+    last = (
+        events.filter(pl.col("encoded_event") == 469)
+        .group_by("example_id")
+        .agg(pl.col("timestamp").max().alias("last_click"))
+    )
+    views = events.join(last, on="example_id", how="left").filter(
+        (pl.col("encoded_event") == 13)
+        & (pl.col("last_click").is_null() | (pl.col("timestamp") > pl.col("last_click")))
+    )
+    per_product = views.group_by("example_id", "encoded_product").agg(pl.len().alias("n13_sc"))
+    per_example = views.group_by("example_id").agg(pl.len().alias("ex_n13_sc"))
+    return (
+        cand.join(per_product, on=["example_id", "encoded_product"], how="left")
+        .join(per_example, on="example_id", how="left")
+        .join(last, on="example_id", how="left")
+        .with_columns(pl.col("n13_sc").fill_null(0), pl.col("ex_n13_sc").fill_null(0))
+        .with_columns(
+            (pl.col("n13_sc") / pl.col("ex_n13_sc").clip(1)).alias("share_sc"),
+            ((pl.col("end") - pl.col("last_click")) / 1000).alias("ex_since_clk"),
+        )
+        .drop("last_click")
+    )
+
+
+CTX = {"ll1": 1, "nb5": 5, "nb20": 20}  # признак -> сколько последних событий истории берём
+
+
+def tail_codes(events, n=20):
+    """Коды последних n событий примера (любые события, не только с продуктом): k = 1 — самое последнее."""
+    e = events.select("example_id", "encoded_event").with_columns(
+        pl.int_range(pl.len()).over("example_id").cast(pl.Int64).alias("i"),
+        pl.len().over("example_id").cast(pl.Int64).alias("n"),
+    )
+    return e.filter(pl.col("i") >= pl.col("n") - n).select(
+        "example_id", (pl.col("n") - pl.col("i")).alias("k"), pl.col("encoded_event").alias("code")
+    )
+
+
+def client_folds(example_ids, clients, n=5):
+    """Фолд примера = client_id % n. У доп. примеров id вида «<пример>_<номер клика>» — клиент тот же."""
+    return (
+        pl.DataFrame({"example_id": example_ids})
+        .with_columns(pl.col("example_id").str.split("_").list.first().alias("base"))
+        .join(clients.rename({"example_id": "base"}), on="base")
+        .select("example_id", (pl.col("client_id") % n).alias("fold"))
+    )
+
+
+def context_tables(tails, labels, folds, products, alpha=30.0):
+    """Таблицы «код события в хвосте истории -> лог-лифт продукта»: во сколько раз чаще обычного
+    кликают продукт, если перед этим клиент был на таком экране.
+    Для каждого фолда таблица считается БЕЗ клиентов этого фолда — пример не видит собственный ответ."""
+    d = tails.join(labels.select("example_id", pl.col("target_product").alias("t")), on="example_id").join(folds, on="example_id")
+    prods = pl.DataFrame({"t": products}).cast(pl.Int32)
+    out = []
+    for f in sorted(folds["fold"].unique().to_list()):
+        rest = d.filter(pl.col("fold") != f)
+        prior = (
+            rest.select("example_id", "t").unique().group_by("t").len()
+            .with_columns((pl.col("len") / pl.col("len").sum()).alias("prior")).select("t", "prior")
+        )
+        for name, n in CTX.items():
+            sub = rest.filter(pl.col("k") <= n).select("example_id", "code", "t").unique()
+            cnt = sub.group_by("code", "t").len()
+            tot = sub.group_by("code").len().rename({"len": "tot"})
+            grid = (
+                tot.join(prods, how="cross")
+                .join(cnt, on=["code", "t"], how="left")
+                .join(prior, on="t", how="left")
+                .with_columns(pl.col("len").fill_null(0), pl.col("prior").fill_null(1e-4))
+            )
+            out.append(grid.select(
+                pl.lit(f).cast(pl.Int32).alias("fold"), pl.lit(name).alias("tab"), "code",
+                pl.col("t").alias("encoded_product"),
+                (((pl.col("len") + alpha * pl.col("prior")) / (pl.col("tot") + alpha)).log() - pl.col("prior").log()).alias("ll"),
+            ))
+    return pl.concat(out).sort("fold", "tab", "code", "encoded_product")
+
+
+def add_context(cand, tails, folds, tables):
+    """Признаки контекста: сумма лог-лифтов продукта по кодам последних 1 / 5 / 20 событий."""
+    t = tails.join(folds.with_columns(pl.col("fold").cast(pl.Int32)), on="example_id")
+    for name, n in CTX.items():
+        s = (
+            t.filter(pl.col("k") <= n).select("example_id", "code", "fold").unique()
+            .join(tables.filter(pl.col("tab") == name).drop("tab"), on=["fold", "code"])
+            .sort("example_id", "encoded_product", "code")  # фиксируем порядок сложения -> воспроизводимость
+            .group_by("example_id", "encoded_product", maintain_order=True)
+            .agg(pl.col("ll").sum().alias(name))
+        )
+        cand = cand.join(s, on=["example_id", "encoded_product"], how="left").with_columns(pl.col(name).fill_null(0.0))
+    return cand
+
+
+def build_features(events, products, pop, fresh=None):
     """Кандидаты + все группы признаков."""
     #pop - таблица из popularity, считается один раз по train и test вместе
     keys = ["example_id", "encoded_product"]
@@ -161,11 +259,13 @@ def build_features(events, products, pop, fresh):
         .with_columns((pl.col("end") // DAY_MS).alias("day"))
         .join(pop, on=["day", "encoded_product"], how="left")
     )
-    cand = (
-        cand.with_columns((pl.col("end") // HOUR_MS).alias("hour"))
-        .join(fresh, on=["hour", "encoded_product"], how="left")
-        .drop("hour")
-    )
+    if fresh is not None:
+        cand = (
+            cand.with_columns((pl.col("end") // HOUR_MS).alias("hour"))
+            .join(fresh, on=["hour", "encoded_product"], how="left")
+            .drop("hour")
+        )
+    cand = add_since_click(cand, events)
     return cand.with_columns(
         (pl.col("n_13") / pl.col("ex_n_13")).alias("share_13") # какая доля показов этого клиента пришлась на продукт
     ).with_columns(
